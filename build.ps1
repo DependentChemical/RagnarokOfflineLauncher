@@ -55,7 +55,9 @@ $exe = Join-Path $root 'ro_launcher.exe'
 Copy-Item -LiteralPath $built -Destination $exe -Force
 
 # The repository is the single source of truth for the configuration.
-foreach ($file in @('ro_launcher.toml', 'README.md')) {
+# (README.md deliberately stays in this repository - it is not published to the
+#  project root, so there is exactly one README.)
+foreach ($file in @('ro_launcher.toml')) {
     $src = Join-Path $crate $file
     if (Test-Path -LiteralPath $src) {
         Copy-Item -LiteralPath $src -Destination (Join-Path $root $file) -Force
