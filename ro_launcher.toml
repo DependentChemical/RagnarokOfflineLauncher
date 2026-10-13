@@ -1,0 +1,99 @@
+# ro_launcher configuration
+#
+# Every path is relative to the project root (the folder holding 1_Database,
+# 2_Server and 3_Client), so the whole stack stays portable: copy the folder
+# anywhere and the launcher adapts. Absolute paths are also accepted.
+#
+# On startup the launcher ALWAYS rewrites stale absolute paths left behind by
+# a previous install location (Laragon's usr/laragon.ini, mysql's my.ini, ...),
+# keeping a .bak copy of every file it touches. There is no switch to turn this
+# off: a moved install simply cannot start MariaDB otherwise.
+
+# --- Step 1: database stack -------------------------------------------------
+# Laragon hard-refuses a root path containing a SPACE ("Laragon path must not
+# have SPACE"), and it starts every service through cmd.exe. `auto` therefore
+# does this:
+#   * path without a space  -> run laragon.exe (hidden)
+#   * path with a space     -> create the junction below and run laragon.exe
+#                              through it (so Laragon sees a space-free root);
+#                              if the junction cannot be made, run mysqld.exe
+#                              directly instead (same MariaDB, same my.ini, and
+#                              its console output is captured as well).
+# Force the behaviour with mode = "laragon" or mode = "direct".
+[laragon]
+mode = "auto"
+link_path = 'D:\RO_Link'                  # must not contain a space
+exe = "1_Database/laragon.exe"
+mysql_exe = "1_Database/bin/mysql/mariadb-11.8.8-winx64/bin/mysqld.exe"
+mysql_ini = "1_Database/bin/mysql/mariadb-11.8.8-winx64/my.ini"
+db_host = "127.0.0.1"
+db_port = 3306
+ready_timeout_secs = 90
+hide_window = true            # ShowWindow(SW_HIDE) on every window it creates
+
+# --- Step 2: the rAthena servers --------------------------------------------
+# Order matters: this mirrors runserver.bat (login -> char -> web -> map), and
+# each server needs the previous one's port to be open.
+[[servers]]
+key = "login"
+exe = "login-server.exe"
+label = "Login-Server"
+cwd = "2_Server"
+ready_port = 6900
+restart = "on"                # runserver.bat "watch": restart after a crash
+
+[[servers]]
+key = "char"
+exe = "char-server.exe"
+label = "Char-Server"
+cwd = "2_Server"
+ready_port = 6121
+restart = "on"
+
+[[servers]]
+key = "web"
+exe = "web-server.exe"
+label = "Web-Server"
+cwd = "2_Server"
+ready_port = 8888
+restart = "on"
+
+[[servers]]
+key = "map"
+exe = "map-server.exe"
+label = "Map-Server"
+cwd = "2_Server"
+ready_port = 5121
+restart = "on"
+
+# --- Step 3: the game client ------------------------------------------------
+[client]
+exe = "3_Client/Ragnarok.exe"
+cwd = "3_Client"
+
+# --- Consolidation ----------------------------------------------------------
+# serv.bat restarts a crashed server after 15 seconds; keep it identical.
+restart_delay_secs = 15
+server_ready_timeout_secs = 30
+
+log_to_file = true
+log_file = "ro_launcher.log"
+colors = true
+timestamps = false
+
+# Scanned (recursively, text files only) by the portable-path repair that runs
+# on every start. `backup_suffix` is appended to each file it rewrites.
+portable_fix_dirs = [
+    "1_Database/usr",
+    "1_Database/etc",
+    "1_Database/bin/laragon",
+    "1_Database/bin/mysql",
+]
+backup_suffix = ".bak"
+
+# MariaDB runs inside Laragon's own console, so its output is tailed from the
+# error log instead and shown as [mariadb.err].
+[mariadb_tail]
+dir = "1_Database/data/mariadb-11.8"
+label = "mariadb.err"
+poll_ms = 500

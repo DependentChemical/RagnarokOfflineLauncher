@@ -1,0 +1,12 @@
+# Build output
+/target/
+
+# Runtime output
+*.log
+
+# Local backups written by the portable-path repair
+*.bak
+
+# Windows cruft
+Thumbs.db
+desktop.ini
