@@ -18,31 +18,31 @@ impl RestartPolicy {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LaragonSpec {
-    pub mysql_exe: PathBuf,
-    pub mysql_ini: PathBuf,
+    pub exe: PathBuf,
+    pub mysql_admin_exe: PathBuf,
     pub db_port: u16,
     pub db_host: String,
     pub ready_timeout_secs: u64,
     pub graceful_db_shutdown: bool,
     pub db_user: String,
     pub db_password: String,
-    pub mysql_admin_exe: PathBuf,
+    pub hide_window: bool,
 }
 
 impl Default for LaragonSpec {
     fn default() -> Self {
         Self {
-            mysql_exe: PathBuf::from("1_Database/bin/mysql/mariadb-11.8.8-winx64/bin/mysqld.exe"),
-            mysql_ini: PathBuf::from("1_Database/bin/mysql/mariadb-11.8.8-winx64/my.ini"),
+            exe: PathBuf::from("1_Database/laragon.exe"),
+            mysql_admin_exe: PathBuf::from(
+                "1_Database/bin/mysql/mariadb-11.8.8-winx64/bin/mariadb-admin.exe",
+            ),
             db_port: 3306,
             db_host: "127.0.0.1".into(),
             ready_timeout_secs: 90,
             graceful_db_shutdown: true,
             db_user: "root".into(),
             db_password: String::new(),
-            mysql_admin_exe: PathBuf::from(
-                "1_Database/bin/mysql/mariadb-11.8.8-winx64/bin/mariadb-admin.exe",
-            ),
+            hide_window: true,
         }
     }
 }
@@ -156,16 +156,12 @@ impl Resolved {
         join(&self.root, &s.cwd)
     }
 
-    pub fn mysql_exe(&self) -> PathBuf {
-        join(&self.root, &self.cfg.laragon.mysql_exe)
+    pub fn laragon_exe(&self) -> PathBuf {
+        join(&self.root, &self.cfg.laragon.exe)
     }
 
     pub fn mysql_admin_exe(&self) -> PathBuf {
         join(&self.root, &self.cfg.laragon.mysql_admin_exe)
-    }
-
-    pub fn mysql_ini(&self) -> PathBuf {
-        join(&self.root, &self.cfg.laragon.mysql_ini)
     }
 
     pub fn client_exe(&self) -> PathBuf {
@@ -186,56 +182,60 @@ pub fn join(root: &Path, rel: &Path) -> PathBuf {
 }
 
 pub fn is_project_root(dir: &Path) -> bool {
-    dir.join("1_Database")
-        .join("bin")
-        .join("mysql")
-        .join("mariadb-11.8.8-winx64")
-        .join("bin")
-        .join("mysqld.exe")
-        .is_file()
+    dir.join("1_Database").join("laragon.exe").is_file()
 }
 
 pub fn discover(cli_root: Option<&Path>) -> (PathBuf, Option<Config>) {
-    let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(r) = cli_root {
-        candidates.push(r.to_path_buf());
+        let normalized = normalize(r);
+        let cfg_path = normalized.join("ro_launcher.toml");
+        let cfg = if cfg_path.is_file() {
+            Config::from_file(&cfg_path).ok()
+        } else {
+            None
+        };
+        return (normalized, cfg);
     }
-    if let Ok(env_root) = std::env::var("RO_ROOT") {
-        candidates.push(PathBuf::from(env_root));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            for up in [0usize, 1, 2, 3] {
-                candidates.push(dir.ancestors().nth(up).unwrap_or(dir).to_path_buf());
-            }
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.clone());
-        candidates.extend(cwd.ancestors().skip(1).take(4).map(|p| p.to_path_buf()));
-    }
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."));
 
-    for cand in &candidates {
-        let cfg_path = cand.join("ro_launcher.toml");
-        if cfg_path.is_file() {
-            match Config::from_file(&cfg_path) {
-                Ok(cfg) => return (normalize(cand), Some(cfg)),
-                Err(e) => {
-                    eprintln!("ro_launcher: ignoring {}: {e:#}", cfg_path.display());
-                }
+    if let Ok(exe) = std::env::current_exe() {
+        for anc in exe.ancestors() {
+            if is_project_root(anc) {
+                let normalized = normalize(anc);
+                let cfg_path = normalized.join("ro_launcher.toml");
+                let cfg = if cfg_path.is_file() {
+                    Config::from_file(&cfg_path).ok()
+                } else {
+                    None
+                };
+                return (normalized, cfg);
             }
         }
     }
-    for cand in &candidates {
-        if is_project_root(cand) {
-            return (normalize(cand), None);
+
+    if let Ok(cwd) = std::env::current_dir() {
+        for anc in cwd.ancestors() {
+            if is_project_root(anc) {
+                let normalized = normalize(anc);
+                let cfg_path = normalized.join("ro_launcher.toml");
+                let cfg = if cfg_path.is_file() {
+                    Config::from_file(&cfg_path).ok()
+                } else {
+                    None
+                };
+                return (normalized, cfg);
+            }
         }
     }
-    (
-        normalize(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-        None,
-    )
+
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let normalized = normalize(&manifest);
+    let cfg_path = normalized.join("ro_launcher.toml");
+    let cfg = if cfg_path.is_file() {
+        Config::from_file(&cfg_path).ok()
+    } else {
+        None
+    };
+    (normalized, cfg)
 }
 
 fn normalize(p: &Path) -> PathBuf {

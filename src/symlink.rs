@@ -12,13 +12,12 @@ pub fn ensure_symlink(real_root: &Path, log: &crate::logging::Logger) -> Result<
     let folderpath_file = exe_dir.join("folderpath");
 
     let drive_root = real_root
-        .components()
-        .next()
-        .and_then(|c| c.as_os_str().to_str())
+        .ancestors()
+        .last()
         .ok_or_else(|| anyhow!("cannot determine drive root of {}", real_root.display()))?;
 
     let base_name = "RO_OFFLINE";
-    let mut link_path = PathBuf::from(drive_root).join(base_name);
+    let mut link_path = drive_root.join(base_name);
 
     if link_path.exists() {
         if let Ok(existing_target) = fs::read_link(&link_path) {
@@ -54,13 +53,13 @@ pub fn ensure_symlink(real_root: &Path, log: &crate::logging::Logger) -> Result<
 }
 
 /// Finds an available symlink name by appending _XXX suffix.
-fn find_available_link(_original: &Path, drive_root: &str) -> Result<PathBuf> {
+fn find_available_link(_original: &Path, drive_root: &Path) -> Result<PathBuf> {
     let mut rng = rand::rng();
     for _ in 0..100 {
         let suffix: String = (0..3)
             .map(|_| rng.sample(rand::distr::Alphanumeric) as char)
             .collect();
-        let candidate = PathBuf::from(drive_root).join(format!("RO_OFFLINE_{}", suffix));
+        let candidate = drive_root.join(format!("RO_OFFLINE_{}", suffix));
         if !candidate.exists() {
             return Ok(candidate);
         }
@@ -141,8 +140,8 @@ mod tests {
     #[test]
     fn test_find_available_link() {
         let dir = tempdir().unwrap();
-        let drive = dir.path().to_str().unwrap();
-        let base = PathBuf::from(drive).join("RO_OFFLINE");
+        let drive = dir.path();
+        let base = drive.join("RO_OFFLINE");
         fs::create_dir_all(&base).unwrap();
 
         let result = find_available_link(&base, drive).unwrap();

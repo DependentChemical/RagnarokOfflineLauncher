@@ -1,7 +1,10 @@
 //! ro_launcher - one console for the whole RO_PreRenewal stack.
 //!
 //! Creates a space-free junction (e.g. D:\RO_OFFLINE) pointing at the project root,
-//! then launches all programs directly under that junction. No config rewriting needed.
+//! then launches all programs directly under that junction in order:
+//!   1. 1_Database/laragon.exe (GUI, hidden) - waits for MariaDB:3306
+//!   2. 2_Server/{login,char,web,map}-server.exe (console captured)
+//!   3. 3_Client/Ragnarok.exe (session; closing it stops everything)
 
 mod client;
 mod clientreg;
@@ -107,10 +110,6 @@ fn run() -> Result<()> {
     let (real_root, cfg_opt) = config::discover(args.root.as_deref());
     let from_file = cfg_opt.is_some();
     let cfg = cfg_opt.unwrap_or_default();
-    let res = Resolved {
-        root: real_root.clone(),
-        cfg,
-    };
 
     let log = Logger::new(true, false, None);
     let log = std::sync::Arc::new(log);
@@ -127,7 +126,10 @@ fn run() -> Result<()> {
     log.step("console commands: s = status, r <login|char|web|map> = restart, q = quit");
 
     if args.dry_run {
-        print_plan(&res, &log);
+        log.step("Boot plan (dry run)");
+        log.step("  1. laragon.exe (via symlink) -> wait for MariaDB:3306");
+        log.step("  2. login-server.exe, char-server.exe, web-server.exe, map-server.exe (via symlink)");
+        log.step("  3. Ragnarok.exe (via symlink)");
         log.step("Dry run: nothing was started, nothing was modified.");
         return Ok(());
     }
@@ -175,7 +177,7 @@ fn run() -> Result<()> {
 
     let effective_res = Resolved {
         root: symlink_root.clone(),
-        cfg: res.cfg,
+        cfg,
     };
 
     let job = Job::new()?;
@@ -193,20 +195,14 @@ fn run() -> Result<()> {
 
     console::spawn((*log).clone(), reg.clone());
 
-    let db = database::start_database(&effective_res, &job, &log, &reg);
-    let db = match db {
-        Ok(db) => db,
-        Err(e) => {
-            shutdown(&effective_res, &job, &reg, &log);
-            release_lock(&lock_path)?;
-            cleanup_symlink(&symlink_root, &exe_dir, &log);
-            return Err(e);
-        }
-    };
-    log.step(format!("Database step 1 complete via {}", db.mode_used.text()));
+    // Step 1: Database (laragon.exe)
+    database::start_database(&effective_res, &job, &log, &reg)?;
+    log.step("Database step complete via laragon.exe");
 
+    // Step 2: Servers
     server::start_all_servers(&effective_res, &job, &log, &reg)?;
 
+    // Step 3: Client
     let mut client = match client::start_client(&effective_res, &job, &log, &reg) {
         Ok(c) => c,
         Err(e) => {
@@ -247,25 +243,6 @@ fn run() -> Result<()> {
     release_lock(&lock_path)?;
     cleanup_symlink(&symlink_root, &exe_dir, &log);
     Ok(())
-}
-
-fn print_plan(res: &Resolved, log: &Logger) {
-    log.step("Boot plan");
-    log.step(format!(
-        "  1. database: mysqld.exe direct (wait for MariaDB {}:{})",
-        res.cfg.laragon.db_host, res.cfg.laragon.db_port
-    ));
-    log.step(format!("       mysqld.exe   {}", res.mysql_exe().display()));
-    for spec in &res.cfg.servers {
-        log.step(format!(
-            "  2. {:<20} cwd={} port={:?} restart={}",
-            spec.exe,
-            res.server_cwd(spec).display(),
-            spec.ready_port,
-            if spec.restart.as_bool() { "on" } else { "off" }
-        ));
-    }
-    log.step(format!("  3. {}", res.client_exe().display()));
 }
 
 fn shutdown(res: &Resolved, job: &Job, reg: &RegistryHandle, log: &Logger) {
