@@ -173,42 +173,6 @@ fn pipe_reader<R: std::io::Read + Send + 'static>(
 }
 
 /// Same as [`spawn_captured`] but with explicit arguments.
-pub fn spawn_captured_with_args(
-    exe: &Path,
-    cwd: &Path,
-    job: &Job,
-    log: &Logger,
-    label: &str,
-    args: &[String],
-) -> Result<(Child, Tracked)> {
-    let mut cmd = Command::new(exe);
-    cmd.args(args)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawning {}", exe.display()))?;
-    if let Err(e) = job.assign(child.id()) {
-        eprintln!("ro_launcher: warning: could not join job: {e:#}");
-    }
-    if let Some(out) = child.stdout.take() {
-        pipe_reader(out, log.clone(), label.to_string(), "stdout");
-    }
-    if let Some(err) = child.stderr.take() {
-        pipe_reader(err, log.clone(), label.to_string(), "stderr");
-    }
-    invalidate_cache();
-    let tracked = Tracked::new(child.id());
-    Ok((child, tracked))
-}
-
 pub fn find_by_name(name: &str) -> Option<(u32, u64)> {
     let name = name.to_ascii_lowercase();
     with_cache(|sys| {
