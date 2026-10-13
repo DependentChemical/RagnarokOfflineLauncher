@@ -1,59 +1,31 @@
 //! Step 1 - the database stack in `1_Database`.
 //!
-//! Two ways to bring MariaDB up, because Laragon has a hard limitation:
-//! **Laragon refuses to run from a path containing a space** ("Laragon path
-//! must not have SPACE"). It also starts every service through `cmd.exe`, so a
-//! space in `D:\NewGaems\Ragnarok Offline\...` breaks its batch commands.
-//!
-//!  * `laragon` - run `laragon.exe` (GUI, hidden). Needs a space-free path; the
-//!    launcher creates a directory junction to get one (see `portable::link`).
-//!  * `direct`  - run `mysqld.exe` ourselves with the captured console, which is
-//!    what the rAthena servers actually need. No space limitation at all, and
-//!    MariaDB's own startup log lands in the one console.
-//!  * `auto`    - `laragon` when the path is space-free or a junction can be
-//!    created, `direct` otherwise.
-//!
-//! Either way we gate on MariaDB's TCP port before touching the servers.
+//! Runs `mysqld.exe` directly with its console captured.
+//! No Laragon, no junction logic - the symlink handles space-free paths.
 
 use anyhow::{anyhow, Result};
-use std::path::{Path, PathBuf};
-use std::thread;
+use std::path::Path;
 use std::time::Duration;
 
-use crate::config::{DbMode, Resolved};
+use crate::config::Resolved;
 use crate::gate::wait_for_port;
 use crate::job::Job;
 use crate::logging::Logger;
-use crate::portable;
-use crate::proc::{find_by_name, hide_windows_of, spawn_captured_with_args, spawn_detached, Tracked};
+use crate::proc::{find_by_name, spawn_captured_with_args, Tracked};
 use crate::registry::{Entry, RegistryHandle, State};
-
-/// Internal decision after applying the `auto` rules.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolveDbMode {
-    Laragon,
-    Direct,
-}
 
 pub struct DbHandle {
     pub mode_used: ModeUsed,
 }
 
-/// Which route the launcher actually took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModeUsed {
-    Laragon,
-    LaragonViaLink,
     DirectMysqld,
 }
 
 impl ModeUsed {
     pub fn text(self) -> &'static str {
-        match self {
-            ModeUsed::Laragon => "laragon.exe",
-            ModeUsed::LaragonViaLink => "laragon.exe (via space-free junction)",
-            ModeUsed::DirectMysqld => "mysqld.exe (direct)",
-        }
+        "mysqld.exe (direct)"
     }
 }
 
@@ -62,143 +34,12 @@ pub fn start_database(
     job: &Job,
     log: &Logger,
     reg: &RegistryHandle,
-    decision: (ResolveDbMode, Option<PathBuf>),
 ) -> Result<DbHandle> {
-    let (mode, link_root) = decision;
-    match mode {
-        ResolveDbMode::Laragon => {
-            let tracked = run_laragon(res, link_root.as_deref(), job, log, reg)?;
-            gate(log, reg, res, &tracked, "laragon.exe")?;
-            Ok(DbHandle {
-                mode_used: if link_root.is_some() {
-                    ModeUsed::LaragonViaLink
-                } else {
-                    ModeUsed::Laragon
-                },
-            })
-        }
-        ResolveDbMode::Direct => {
-            let tracked = run_mysqld(res, job, log, reg)?;
-            gate(log, reg, res, &tracked, "mysqld.exe")?;
-            Ok(DbHandle {
-                mode_used: ModeUsed::DirectMysqld,
-            })
-        }
-    }
-}
-
-/// Decides how the database stack will be started, creating the space-free
-/// junction when one is needed. Run this *before* the portability repair so
-/// that Laragon's config files are rewritten to the very root Laragon will see
-/// (otherwise Laragon reads a path with a space and its cmd.exe service
-/// commands fail with "is not recognized as an internal or external command").
-pub fn decide(res: &Resolved, log: &Logger) -> (ResolveDbMode, Option<PathBuf>) {
-    decide_mode(res, log)
-}
-
-/// The root the whole stack should be treated as: the junction when Laragon
-/// runs through it, otherwise the real root.
-pub fn effective_root(res: &Resolved, link: Option<&Path>) -> PathBuf {
-    link.map(|p| p.to_path_buf()).unwrap_or_else(|| res.root.clone())
-}
-
-fn decide_mode(res: &Resolved, log: &Logger) -> (ResolveDbMode, Option<PathBuf>) {
-    let has_space = res.root.to_string_lossy().contains(' ');
-    match res.cfg.laragon.mode {
-        DbMode::Direct => (ResolveDbMode::Direct, None),
-        DbMode::Laragon => {
-            if has_space {
-                match portable::space_free_link(&res.root, &res.cfg.laragon.link_path, log) {
-                    Ok(link) => {
-                        log.step(format!(
-                            "Root path contains a space; using junction {} -> {}",
-                            link.display(),
-                            res.root.display()
-                        ));
-                        (ResolveDbMode::Laragon, Some(link))
-                    }
-                    Err(e) => {
-                        log.warn(format!(
-                            "Laragon cannot run from a path with a space and the junction \
-                             could not be created ({e:#}); starting MariaDB directly instead"
-                        ));
-                        (ResolveDbMode::Direct, None)
-                    }
-                }
-            } else {
-                (ResolveDbMode::Laragon, None)
-            }
-        }
-        DbMode::Auto => {
-            if !has_space {
-                (ResolveDbMode::Laragon, None)
-            } else if let Ok(link) =
-                portable::space_free_link(&res.root, &res.cfg.laragon.link_path, log)
-            {
-                log.step(format!(
-                    "Root path contains a space; using junction {} -> {}",
-                    link.display(),
-                    res.root.display()
-                ));
-                (ResolveDbMode::Laragon, Some(link))
-            } else {
-                log.step(
-                    "Root path contains a space; starting MariaDB directly instead of Laragon",
-                );
-                (ResolveDbMode::Direct, None)
-            }
-        }
-    }
-}
-
-fn run_laragon(
-    res: &Resolved,
-    link_root: Option<&Path>,
-    job: &Job,
-    log: &Logger,
-    reg: &RegistryHandle,
-) -> Result<Tracked> {
-    // Through the junction, Laragon sees (and stores) a space-free root.
-    let root = link_root.unwrap_or(&res.root);
-    let exe = root.join("1_Database").join("laragon.exe");
-    if !exe.is_file() {
-        return Err(anyhow!("{} not found", exe.display()));
-    }
-    let cwd = exe.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let name = "laragon.exe";
-
-    log.step(format!("Running {name}"));
-    let mut child = spawn_detached(&exe, &cwd, job)?;
-    let tracked = Tracked::new(child.id());
-    reg.upsert(
-        "laragon",
-        Entry {
-            label: name.into(),
-            state: State::Starting,
-            tracked: Some(tracked.clone()),
-            order: 0,
-            restart: crate::config::RestartPolicy::On,
-        },
-    );
-
-    if res.cfg.laragon.hide_window {
-        // std::process cannot set STARTUPINFO.wShowWindow, so we hide whatever
-        // windows the process owns right after it creates them. Laragon builds
-        // its tray window asynchronously, hence the retries.
-        let pid = child.id();
-        thread::spawn(move || {
-            for delay in [0u64, 300, 1500] {
-                if delay > 0 {
-                    thread::sleep(Duration::from_millis(delay));
-                }
-                hide_windows_of(pid);
-            }
-        });
-    }
-    thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(tracked)
+    let tracked = run_mysqld(res, job, log, reg)?;
+    gate(log, reg, res, &tracked, "mysqld.exe")?;
+    Ok(DbHandle {
+        mode_used: ModeUsed::DirectMysqld,
+    })
 }
 
 /// Starts MariaDB with its console captured - `[mysqld.exe] ...` in our window.
@@ -251,10 +92,6 @@ fn run_mysqld(res: &Resolved, job: &Job, log: &Logger, reg: &RegistryHandle) -> 
 }
 
 /// Asks MariaDB to shut down cleanly before the job force-kills it.
-///
-/// A hard kill leaves MyISAM tables flagged "marked as crashed and should be
-/// repaired" (ragnarok.login, vendings, buyingstores, ...) and leaves InnoDB to
-/// run crash recovery on the next boot. `mariadb-admin shutdown` avoids both.
 pub fn graceful_shutdown(res: &Resolved, log: &Logger) -> bool {
     if !res.cfg.laragon.graceful_db_shutdown {
         return false;
@@ -273,8 +110,6 @@ pub fn graceful_shutdown(res: &Resolved, log: &Logger) -> bool {
 
     let mut cmd = std::process::Command::new(&admin);
     cmd.arg(format!("--defaults-file={}", ini.display()))
-        // Force TCP: `localhost` would make the client look for the unix
-        // socket / named pipe from my.ini instead of the listening port.
         .arg("--protocol=TCP")
         .arg("-h")
         .arg(&res.cfg.laragon.db_host)
@@ -313,7 +148,6 @@ pub fn graceful_shutdown(res: &Resolved, log: &Logger) -> bool {
         return false;
     }
 
-    // Wait for the port to be released so we know the server is really gone.
     let host = res.cfg.laragon.db_host.clone();
     let port = res.cfg.laragon.db_port;
     for _ in 0..40 {
@@ -352,20 +186,16 @@ fn gate(
             log.error(format!("{what} is no longer running - see its output above."));
         } else {
             log.error(
-                "Check 1_Database/usr/laragon.ini and 1_Database/bin/mysql/*/my.ini (datadir=), \
+                "Check 1_Database/bin/mysql/*/my.ini (datadir=), \
                  and that nothing else already holds port 3306.",
             );
         }
-        let _ = reg;
         return Err(anyhow!("database never became ready"));
     }
     log.ok(format!(
         "{what} Running (pid={}) - MariaDB ready on {host}:{port}",
         tracked.pid
     ));
-    reg.set_state(
-        if what == "laragon.exe" { "laragon" } else { "database" },
-        State::Running,
-    );
+    reg.set_state("database", State::Running);
     Ok(())
 }
