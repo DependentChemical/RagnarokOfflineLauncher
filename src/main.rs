@@ -149,6 +149,12 @@ fn run() -> Result<()> {
         }
     }
 
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let servers_already_running = symlink::other_launcher_running(&exe_dir, &log);
+
     let symlink_root = match ensure_symlink(&real_root, &log) {
         Ok(p) => p,
         Err(e) => {
@@ -195,21 +201,25 @@ fn run() -> Result<()> {
 
     console::spawn((*log).clone(), reg.clone());
 
-    // Step 1: Database (laragon.exe)
-    database::start_database(&effective_res, &job, &log, &reg)?;
-    log.step("Database step complete via laragon.exe");
+    // Step 1 & 2: only start the stack when no other launcher is running it.
+    if !servers_already_running {
+        database::start_database(&effective_res, &job, &log, &reg)?;
+        log.step("Database step complete via laragon.exe");
 
-    // Step 2: Servers
-    server::start_all_servers(&effective_res, &job, &log, &reg)?;
+        server::start_all_servers(&effective_res, &job, &log, &reg)?;
+    } else {
+        log.step("Server stack already running; starting client only");
+    }
+
 
     // Step 3: Client
     let mut client = match client::start_client(&effective_res, &job, &log, &reg) {
         Ok(c) => c,
         Err(e) => {
             log.error(format!("Ragnarok.exe could not be started: {e:#}"));
-            shutdown(&effective_res, &job, &reg, &log);
-            release_lock(&lock_path)?;
-            cleanup_symlink(&symlink_root, &exe_dir, &log);
+    shutdown(&effective_res, &job, &reg, &log);
+    release_lock(&lock_path)?;
+    cleanup_symlink(&symlink_root, &exe_dir, &log);
             return Err(e);
         }
     };
@@ -228,8 +238,12 @@ fn run() -> Result<()> {
 
     let Some(status) = client::wait_for_exit(&mut client, &reg, &log) else {
         log.step("Ragnarok.exe closed");
-        shutdown(&effective_res, &job, &reg, &log);
         release_lock(&lock_path)?;
+        if symlink::is_last_user(&exe_dir) {
+            shutdown(&effective_res, &job, &reg, &log);
+        } else {
+            log.step("Other launcher instances still running; leaving services running");
+        }
         cleanup_symlink(&symlink_root, &exe_dir, &log);
         return Ok(());
     };
@@ -239,8 +253,12 @@ fn run() -> Result<()> {
         client.pid
     ));
 
-    shutdown(&effective_res, &job, &reg, &log);
     release_lock(&lock_path)?;
+    if symlink::is_last_user(&exe_dir) {
+        shutdown(&effective_res, &job, &reg, &log);
+    } else {
+        log.step("Other launcher instances still running; leaving services running");
+    }
     cleanup_symlink(&symlink_root, &exe_dir, &log);
     Ok(())
 }

@@ -209,8 +209,6 @@ pub fn spawn_captured_with_args(
     Ok((child, tracked))
 }
 
-/// `tasklist /FI "IMAGENAME eq <name>"` equivalent.
-/// Returns the PID and start time of the first live match.
 pub fn find_by_name(name: &str) -> Option<(u32, u64)> {
     let name = name.to_ascii_lowercase();
     with_cache(|sys| {
@@ -221,6 +219,23 @@ pub fn find_by_name(name: &str) -> Option<(u32, u64)> {
         }
         None
     })
+}
+
+/// Returns the image name of a live process, if any.
+pub fn process_name(pid: u32) -> Option<String> {
+    with_cache(|sys| {
+        sys.process(sysinfo::Pid::from_u32(pid))
+            .map(|p| p.name().to_string_lossy().to_string())
+    })
+}
+
+/// True only if pid is a live `ro_launcher.exe`.
+pub fn is_ro_launcher(pid: u32) -> bool {
+    // Force a fresh table so a stale entry can't masquerade.
+    invalidate_cache();
+    process_name(pid)
+        .map(|n| n.eq_ignore_ascii_case("ro_launcher.exe"))
+        .unwrap_or(false)
 }
 
 /// Shared, periodically refreshed process table.

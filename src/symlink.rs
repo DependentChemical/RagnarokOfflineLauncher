@@ -87,8 +87,76 @@ pub fn release_lock(lock_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Checks if there are any other lock files for this symlink.
+use crate::proc;
+
+/// Extracts a PID from a lock file path (filename `folderpath{pid}.lock`)
+/// or, as a fallback, from the file's contents.
+pub fn lock_pid(path: &Path) -> Option<u32> {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if let Some(rest) = name.strip_prefix("folderpath") {
+            if let Some(num) = rest.strip_suffix(".lock") {
+                if let Ok(pid) = num.parse::<u32>() {
+                    return Some(pid);
+                }
+            }
+        }
+    }
+    if let Ok(contents) = fs::read_to_string(path) {
+        if let Ok(pid) = contents.trim().parse::<u32>() {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+fn valid_launcher_lock(path: &Path) -> bool {
+    let Some(pid) = lock_pid(path) else {
+        return false;
+    };
+    if pid == process::id() {
+        return false;
+    }
+    proc::is_ro_launcher(pid)
+}
+
+/// Removes any `folderpath*.lock` files that are residual
+/// (missing PID, dead process, or not an ro_launcher.exe).
+pub fn purge_residual_locks(exe_dir: &Path) {
+    if let Ok(entries) = fs::read_dir(exe_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("folderpath") && name.ends_with(".lock") && !valid_launcher_lock(&path) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+/// True if another live ro_launcher currently holds a server lock.
+pub fn other_launcher_running(exe_dir: &Path, log: &crate::logging::Logger) -> bool {
+    purge_residual_locks(exe_dir);
+    if let Ok(entries) = fs::read_dir(exe_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = entry.path();
+            if name.starts_with("folderpath") && name.ends_with(".lock") && valid_launcher_lock(&path) {
+                if let Some(pid) = lock_pid(&path) {
+                    if pid != process::id() {
+                        log.step(format!(
+                            "Existing ro_launcher (pid {pid}) holds a server lock; skipping server setup"
+                        ));
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn is_last_user(exe_dir: &Path) -> bool {
+    purge_residual_locks(exe_dir);
     let entries = fs::read_dir(exe_dir).ok();
     if let Some(entries) = entries {
         for entry in entries.flatten() {
